@@ -1,0 +1,995 @@
+#!/usr/bin/env python3
+###############################################################################
+# ssara_federated_query.py
+#
+#  Project:  Seamless SAR Archive
+#  Purpose:  Command line federated query client
+#  Author:   Scott Baker, Kang Wang
+#  Created:  June 2013
+#  Updated:  October 2023 
+#
+###############################################################################
+#  Copyright (c) 2013, Scott Baker 
+# 
+#  Permission is hereby granted, free of charge, to any person obtaining a
+#  copy of this software and associated documentation files (the "Software"),
+#  to deal in the Software without restriction, including without limitation
+#  the rights to use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of the Software, and to permit persons to whom the
+#  Software is furnished to do so, subject to the following conditions:
+# 
+#  The above copyright notice and this permission notice shall be included
+#  in all copies or substantial portions of the Software.
+# 
+#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+#  OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+#  THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+#  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+#  DEALINGS IN THE SOFTWARE.
+###############################################################################
+from __future__ import print_function
+import os
+import sys
+import json
+import datetime
+import time
+import csv
+import urllib.request
+from xml.dom import minidom
+import itertools
+import operator
+import re
+import optparse
+import threading
+import subprocess as sub
+import urllib
+import math
+import base64
+
+try:
+    # For Python 3.0 and later
+    from urllib.request import (
+        urlopen,
+        HTTPCookieProcessor,
+        HTTPPasswordMgrWithDefaultRealm,
+        HTTPBasicAuthHandler,
+        HTTPDigestAuthHandler,
+        build_opener,
+        install_opener,
+    ) 
+    from urllib.parse import urlencode
+    from urllib.error import HTTPError
+    from queue import Queue
+    print(f"running with python3")
+except ImportError as e:
+    print(f"e")
+
+import ssl
+import password_config
+#import ssara_federated_query.password_config as password_config
+
+# Try to import shapely for AOI overlap calculations, auto-install if needed
+SHAPELY_AVAILABLE = False
+try:
+    from shapely import wkt
+    from shapely.geometry import shape
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    print("shapely not found. Attempting to install...")
+    try:
+        import subprocess
+        import sys
+        
+        # Try multiple installation methods
+        install_success = False
+        
+        # Method 1: Try with --user flag (works on most systems)
+        try:
+            print("Trying: pip install --user shapely")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "shapely"], 
+                                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            install_success = True
+            print("✓ shapely installed with --user flag")
+        except:
+            pass
+        
+        # Method 2: Try with --break-system-packages (for externally-managed environments)
+        if not install_success:
+            try:
+                print("Trying: pip install --break-system-packages shapely")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--break-system-packages", "shapely"],
+                                    stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                install_success = True
+                print("✓ shapely installed with --break-system-packages")
+            except:
+                pass
+        
+        if install_success:
+            print("Re-importing shapely...")
+            try:
+                from shapely import wkt
+                from shapely.geometry import shape
+                SHAPELY_AVAILABLE = True
+                print("✓ shapely loaded successfully!")
+            except ImportError:
+                print("Warning: shapely installation succeeded but import failed.")
+                print("Please restart the script to use AOI overlap filtering.")
+        else:
+            raise Exception("All installation methods failed")
+            
+    except Exception as e:
+        print(f"\n{'='*70}")
+        print("Could not auto-install shapely.")
+        print("AOI overlap filtering will be disabled for this run.")
+        print(f"{'='*70}")
+        print("\nTo enable AOI overlap filtering, install shapely manually:")
+        print("\n  Option 1 (Recommended): Use virtual environment")
+        print("    python3 -m venv ~/ssara_env")
+        print("    source ~/ssara_env/bin/activate")
+        print("    pip install shapely")
+        print("    python ssara_federated_query.py [your options]")
+        print("\n  Option 2: Install with --user flag")
+        print("    pip install --user shapely")
+        print("\n  Option 3: Use Homebrew (macOS)")
+        print("    brew install shapely")
+        print(f"{'='*70}\n")
+
+
+###################################################################################################
+DESCRIPTION = """
+Command line client for searching with the SSARA Federated API, 
+creating KMLs, and downloading data.  See the options and 
+descriptions below for details and usage examples.
+
+For questions or comments, contact geodeticimaging@earthscope.org
+"""
+
+SSARA_API_URL_ROOT = "https://web-services.unavco.org/brokered/ssara"
+
+EXAMPLE = """Usage Examples:
+  These will do the search and create a KML:
+    ssara_federated_query.py -p SENTINEL-1 -r 14 -b '-112.9, -112, 38.4, 39.0' --download --parallel=4
+    ssara_federated_query.py --platform=ENVISAT -r 170 -f 2925 --kml
+    ssara_federated_query.py --platform=ENVISAT -r 170,392 -f 2925,657-693 -s 2003-01-01 -e 2008-01-01 --kml
+    ssara_federated_query.py --platform=ENVISAT,ERS-1,ERS-2 -r 170 -f 2925 --collectionName="WInSAR ESA,EarthScope ESA" --kml
+    ssara_federated_query.py --platform=ENVISAT --intersectsWith='POLYGON((-118.3 33.7, -118.3 33.8, -118.0 33.8, -118.0 33.7, -118.3 33.7))' --kml
+
+  New: Select query sources (earthscope, asf); Search with point and radius (km); Filtering results by minimum AOI overlap percentage:
+    ssara_federated_query.py --dataSources=earthscope --platform=ALOS-2 --intersectsWith='POLYGON((-118.444 33.597,-117.765 33.597,-117.765 34.036,-118.444 34.036,-118.444 33.597))' --kml
+    ssara_federated_query.py --platform=SENTINEL-1 --point='-118.2437,34.0522' --radius=50 --kml
+    ssara_federated_query.py --platform=SENTINEL-1 --point='-118,34' --radius=75 --minAoiOverlap=50 --kml  
+    ssara_federated_query.py --platform=SENTINEL-1 --intersectsWith='POLYGON((...))' --minAoiOverlap=50 --kml
+  
+  To download data, add the --download option and add your user credentials to the password_config.py file
+    ssara_federated_query.py --platform=ENVISAT -r 170 -f 2925 --download 
+    ssara_federated_query.py --platform=ENVISAT -r 170,392 -f 2925,657-693 -s 2003-01-01 -e 2008-01-01 --download 
+    ssara_federated_query.py --platform=ENVISAT,ERS-1,ERS-2 -r 170 -f 2925 --collection="WInSAR ESA,EarthScope ESA" --download 
+
+"""
+
+
+class MyParser(optparse.OptionParser):
+    def format_epilog(self, formatter):
+        return self.epilog
+    def format_description(self, formatter):
+        return self.description
+
+
+def calculate_aoi_overlap_percentage(scene_wkt, aoi_wkt):
+    """
+    Calculate the percentage of AOI covered by the scene footprint
+    
+    Args:
+        scene_wkt: WKT string of scene footprint
+        aoi_wkt: WKT string of AOI
+        
+    Returns:
+        float: Percentage of AOI covered by scene (0-100)
+    """
+    if not SHAPELY_AVAILABLE:
+        return 100.0  # If shapely not available, assume full overlap
+    
+    try:
+        scene_geom = wkt.loads(scene_wkt)
+        aoi_geom = wkt.loads(aoi_wkt)
+        
+        # Calculate intersection
+        intersection = scene_geom.intersection(aoi_geom)
+        
+        if intersection.is_empty:
+            return 0.0
+        
+        # Calculate percentage of AOI covered
+        aoi_area = aoi_geom.area
+        if aoi_area == 0:
+            return 100.0
+        
+        overlap_percentage = (intersection.area / aoi_area) * 100.0
+        return min(100.0, max(0.0, overlap_percentage))
+        
+    except Exception as e:
+        print(f"Warning: Error calculating overlap for scene: {e}")
+        return 100.0  # If calculation fails, don't filter out
+
+
+def filter_scenes_by_aoi_overlap(scenes, aoi_wkt, min_overlap_percent):
+    """
+    Filter scenes based on minimum AOI overlap percentage
+    
+    Args:
+        scenes: List of scene dictionaries
+        aoi_wkt: WKT string of AOI
+        min_overlap_percent: Minimum overlap percentage (0-100)
+        
+    Returns:
+        List of filtered scenes
+    """
+    if not aoi_wkt or min_overlap_percent <= 0:
+        return scenes
+    
+    if not SHAPELY_AVAILABLE:
+        print("Warning: shapely not available. Skipping AOI overlap filtering.")
+        return scenes
+    
+    print(f"Filtering scenes with minimum {min_overlap_percent}% AOI overlap...")
+    
+    filtered_scenes = []
+    for scene in scenes:
+        if 'stringFootprint' not in scene or not scene['stringFootprint']:
+            # If no footprint, keep the scene
+            filtered_scenes.append(scene)
+            continue
+        
+        overlap_percent = calculate_aoi_overlap_percentage(
+            scene['stringFootprint'], 
+            aoi_wkt
+        )
+        
+        # Store overlap percentage in scene for reference
+        scene['_aoiOverlapPercent'] = round(overlap_percent, 1)
+        
+        if overlap_percent >= min_overlap_percent:
+            filtered_scenes.append(scene)
+    
+    removed_count = len(scenes) - len(filtered_scenes)
+    print(f"Filtering complete: {len(filtered_scenes)} scenes match criteria ({removed_count} removed)")
+    
+    return filtered_scenes
+
+def create_circle_wkt(center_lat, center_lon, radius_km, num_points=64):
+    """
+    Create a WKT POLYGON string representing a circle
+    
+    Args:
+        center_lat: Center latitude in degrees
+        center_lon: Center longitude in degrees
+        radius_km: Radius in kilometers
+        num_points: Number of points to approximate the circle (default 64)
+    
+    Returns:
+        WKT POLYGON string
+    """
+    earth_radius_km = 6371.0
+    points = []
+    
+    # Convert center to radians
+    center_lat_rad = math.radians(center_lat)
+    center_lon_rad = math.radians(center_lon)
+    
+    # Calculate angular distance
+    angular_distance = radius_km / earth_radius_km
+    
+    # Generate points around the circle
+    for i in range(num_points + 1):
+        bearing = math.radians(i * 360.0 / num_points)
+        
+        # Calculate point using spherical geometry
+        point_lat_rad = math.asin(
+            math.sin(center_lat_rad) * math.cos(angular_distance) +
+            math.cos(center_lat_rad) * math.sin(angular_distance) * math.cos(bearing)
+        )
+        
+        point_lon_rad = center_lon_rad + math.atan2(
+            math.sin(bearing) * math.sin(angular_distance) * math.cos(center_lat_rad),
+            math.cos(angular_distance) - math.sin(center_lat_rad) * math.sin(point_lat_rad)
+        )
+        
+        # Convert back to degrees
+        point_lat = math.degrees(point_lat_rad)
+        point_lon = math.degrees(point_lon_rad)
+        
+        # Normalize longitude to -180 to 180
+        while point_lon > 180:
+            point_lon -= 360
+        while point_lon < -180:
+            point_lon += 360
+        
+        # Clamp latitude to valid range
+        point_lat = max(-90, min(90, point_lat))
+        
+        points.append(f"{point_lon:.6f} {point_lat:.6f}")
+    
+    return f"POLYGON(({', '.join(points)}))"
+    
+# def main(argv):
+def main():
+    ### READ IN PARAMETERS FROM THE COMMAND LINE ###
+    parser = MyParser(description=DESCRIPTION, epilog=EXAMPLE, version='1.0')
+    querygroup = optparse.OptionGroup(parser, "Query Parameters", "These options are used for the API query.  "  
+                                      "Use options to limit what is returned by the search. These options act as a way "
+                                      "to filter the results and narrow down the search results.")
+    
+    querygroup.add_option('-p','--platform', action="store", dest="platform", metavar='<ARG>', default='',
+                      help="List of platforms: ALOS,ALOS-2,COSMO-SKYMED-1,COSMO-SKYMED-2,COSMO-SKYMED-3,COSMO-SKYMED-4," \
+                      "CSK-SECOND-GEN-1,CSK-SECOND-GEN-2,ERS-1,ERS-2,ENVISAT,RADARSAT-1,RADARSAT-2,TERRASAR-X,TANDEM-X,SENTINEL-1,PAZ")
+    # querygroup.add_option('-p','--platform', action="store", dest="platform", metavar='<ARG>', default='',
+    #                     help='List of platforms (i.e. ALOS, ENVISAT, ERS-2...')
+    querygroup.add_option('-a','--absoluteOrbit', action="store", dest="absoluteOrbit", metavar='<ARG>', default='',
+                          help='Absolute orbit (single orbit or list)')                      
+    querygroup.add_option('-r', '--relativeOrbit', action="store", dest="relativeOrbit", metavar='<ARG>', default='',
+                          help='Relative Orbit (ie track or path)')  
+    querygroup.add_option('-i','--intersectsWith', action="store", dest="intersectsWith", metavar='<ARG>', default='',
+                          help='WKT format POINT,LINE, or POLYGON')
+    querygroup.add_option('--point', action="store", dest="point", metavar='<ARG>', default='',
+                        help='Center point as lon,lat (e.g., -118.2437,34.0522) - use with --radius')
+    querygroup.add_option('--radius', action="store", dest="radius", type="float", metavar='<ARG>', default=0,
+                          help='Radius in kilometers (use with --point to create circular search area)')
+    
+    querygroup.add_option('-b','--bbox', action="store", dest="boundingBox", metavar='<ARG>', default='',
+                          help='Bounding box in WESN')
+    querygroup.add_option('-f', '--frame', action="store", dest="frame", metavar='<ARG>', default='',
+                          help='frame(s) (single frame or as a list or range)')  
+    querygroup.add_option('-s', '--start', action="store", dest="start", metavar='<ARG>', default='',
+                          help='start date for acquisitions')
+    querygroup.add_option('-e', '--end', action="store", dest="end", metavar='<ARG>', default='',
+                          help='end date for acquisitions')
+    querygroup.add_option('--beamMode', action="store", dest="beamMode", metavar='<ARG>', default='',help='list of beam modes')  
+    querygroup.add_option('--beamSwath', action="store", dest="beamSwath", metavar='<ARG>', default='',help='list of swaths: S1, S2, F1, F4...')
+    querygroup.add_option('--flightDirection', action="store", dest="flightDirection", metavar='<ARG>', default='',
+                          help='Flight Direction (A or D, default is both)')
+    querygroup.add_option('--lookDirection', action="store", dest="lookDirection", metavar='<ARG>', default='',
+                          help='Look Direction (L or R, default is both)')
+    querygroup.add_option('--polarization', action="store", dest="polarization", metavar='<ARG>', default='',help='single or as a list')
+    querygroup.add_option('--collectionName', action="store", dest="collectionName", metavar='<ARG>', default='',
+                          help='single collection or list of collections')  
+    querygroup.add_option('--processingLevel', action="store", dest="processingLevel", default='',
+                          help='Processing Level of data: RAW/SLC/INTERFEROGRAM/LOS_TIMESERIES' )
+    querygroup.add_option('--maxResults', action="store", dest="maxResults", type="int", metavar='<ARG>',
+                          help='maximum number of results to return (from each archive)')
+    querygroup.add_option('--dataSources', action="store", dest="dataSources", metavar='<ARG>', default='earthscope,asf',
+                          help='list of data sources to query (default: earthscope,asf)')
+    querygroup.add_option('--minAoiOverlap', action="store", dest="minAoiOverlap", type="float", metavar='<ARG>', default=0.0,
+                          help='Minimum percentage of AOI that must be covered by scene footprint (0-100, default: 0)')
+    parser.add_option_group(querygroup)
+
+    resultsgroup = optparse.OptionGroup(parser, "Result Options", "These options handle the results returned by the API query")
+    resultsgroup.add_option('--kml', action="store_true", default=False, help='create a KML of query') 
+    resultsgroup.add_option('--kmlName', action="store", dest="kml_filename", type="str", metavar='<ARG>', help='Filename for KML output')
+    resultsgroup.add_option('--csv', action="store_true", default=False, help='create a CSV of query')
+    resultsgroup.add_option('--print', action="store_true", default=False, help='print results to screen')
+    resultsgroup.add_option('--download', action="store_true", default=False, help='download the data')
+    resultsgroup.add_option('--parallel', action="store", dest="parallel", type="int", default=1, metavar='<ARG>',
+                            help='number of scenes to download in parallel (default=%default)')
+    resultsgroup.add_option('--monthMin', action="store", dest="monMin",type="int", metavar='<ARG>', help='minimum integer month')
+    resultsgroup.add_option('--monthMax', action="store", dest="monMax",type="int", metavar='<ARG>', help='maximum integer month')
+    resultsgroup.add_option('--noswath', action="store_true", default=False, help='Enforce first_frame==final_frame (i.e. not a swath)')
+    resultsgroup.add_option('--dem', action="store_true", default=False, help='OT call for DEM')
+    resultsgroup.add_option('--asfResponseTimeout', action="store", dest="asfResponseTimeout", type="int", metavar='<ARG>',
+                            help='Set the timeout length for ASF API response (SSARA server defaults to 15 sec.)')
+    resultsgroup.add_option('--s1orbits', action="store_true", default=False, help="Download S1 orbits from ESA for the result set")
+    parser.add_option_group(resultsgroup) 
+    # opts, remainder = parser.parse_args(argv)
+    opts, remainder = parser.parse_args()
+    if len(sys.argv) < 2:
+        parser.print_help()
+        exit(1)
+
+    opt_dict = vars(opts)
+
+    # boundingBox --> intersectsWith
+    if opt_dict['boundingBox']:
+        # S, N, W, E = opt_dict['boundingBox'].split(',')
+        W, E, S, N = opt_dict['boundingBox'].split(',')
+
+        lats = [N, N, S, S, N]
+        lons = [W, E, E, W, W]
+        polygon = "POLYGON((" + ",".join([lon + " " + lat for lon, lat in zip(lons, lats)])  + "))"
+        opt_dict['intersectsWith'] = polygon
+        print('convert bounding box to polygon: {}'.format(polygon))
+    
+    if opt_dict['point'] and opt_dict['radius']:
+        try:
+            # Parse point (format: "lon,lat")
+            coords = opt_dict['point'].split(',')
+            if len(coords) != 2:
+                print("Error: point must be in format 'lon,lat' (e.g., '-118.2437,34.0522')")
+                exit(1)
+            
+            center_lon = float(coords[0].strip())
+            center_lat = float(coords[1].strip())
+            radius_km = float(opt_dict['radius'])           
+            # Validate
+            if not (-90 <= center_lat <= 90):
+                print(f"Error: Latitude must be between -90 and 90, got {center_lat}")
+                exit(1)
+            if not (-180 <= center_lon <= 180):
+                print(f"Error: Longitude must be between -180 and 180, got {center_lon}")
+                exit(1)
+            if radius_km <= 0:
+                print(f"Error: Radius must be greater than 0, got {radius_km}")
+                exit(1)
+            
+            # Convert to WKT polygon
+            polygon = create_circle_wkt(center_lat, center_lon, radius_km)
+            opt_dict['intersectsWith'] = polygon
+            print(f'Converted point+radius to circular polygon: center=({center_lat}, {center_lon}), radius={radius_km}km')
+            print(f'Generated WKT: {polygon[:80]}...')
+            
+        except ValueError as e:
+            print(f"Error: Invalid point or radius format: {e}")
+            exit(1)
+        except Exception as e:
+            print(f"Error processing point and radius: {e}")
+            exit(1)
+
+    ### BUILD DICTIONARY WITH QUERY FIELDS TO THE API ###
+    query_dict = {}
+    if opt_dict['platform']: query_dict['platform'] = opt_dict['platform']
+    if opt_dict['absoluteOrbit']: query_dict['absoluteOrbit'] = opt_dict['absoluteOrbit']
+    if opt_dict['relativeOrbit']: query_dict['relativeOrbit'] = opt_dict['relativeOrbit']
+    if opt_dict['frame']: query_dict['frame'] = opt_dict['frame']
+    if opt_dict['start']: query_dict['start'] = opt_dict['start']
+    if opt_dict['end']: query_dict['end'] = opt_dict['end']
+    if opt_dict['beamMode']: query_dict['beamMode'] = opt_dict['beamMode']
+    if opt_dict['beamSwath']: query_dict['beamSwath'] = opt_dict['beamSwath']
+    if opt_dict['flightDirection']: query_dict['flightDirection'] = opt_dict['flightDirection']
+    if opt_dict['lookDirection']: query_dict['lookDirection'] = opt_dict['lookDirection']
+    if opt_dict['polarization']: query_dict['polarization'] = opt_dict['polarization']
+    if opt_dict['collectionName']: query_dict['collectionName'] = opt_dict['collectionName']
+    if opt_dict['processingLevel']: query_dict['processingLevel'] = opt_dict['processingLevel']
+    if opt_dict['maxResults']: query_dict['maxResults'] = opt_dict['maxResults']
+    if opt_dict['intersectsWith']: query_dict['intersectsWith'] = opt_dict['intersectsWith']
+    if opt_dict['asfResponseTimeout']: query_dict['asfResponseTimeout'] = opt_dict['asfResponseTimeout']
+    if opt_dict['dataSources']: query_dict['dataSources'] = opt_dict['dataSources']
+
+    ### QUERY THE APIs AND GET THE JSON RESULTS ###
+    params = urlencode(query_dict)
+    # ssara_url = "https://web-services.unavco.org/brokered/ssara/api/sar/search?%s" % params
+    ssara_url = SSARA_API_URL_ROOT + "/api/sar/search?%s" % params
+
+    print("Running SSARA API Query: ",ssara_url)
+    t = time.time()
+    f = urlopen(ssara_url)
+    json_data = f.read().decode('utf8')
+    data = json.loads(json_data)
+    scenes = data['resultList']
+    nscenes_all = len(scenes)
+    print("SSARA API query: %f seconds" % (time.time()-t))
+
+    if data['message']:
+        print("###########################")
+        for d in data['message']:
+            print(d)
+        print("###########################")
+
+    print("Found %d scenes" % len(scenes))
+    if not scenes: 
+        exit()
+    
+    # Apply AOI overlap filtering if specified
+    if opt_dict['minAoiOverlap'] > 0 and opt_dict['intersectsWith']:
+        scenes = filter_scenes_by_aoi_overlap(
+            scenes, 
+            opt_dict['intersectsWith'], 
+            opt_dict['minAoiOverlap']
+        )
+        print("After AOI overlap filtering: %d scenes" % len(scenes))
+        if not scenes:
+            print("No scenes meet the minimum AOI overlap threshold")
+            exit()
+    
+    ### ORDER THE SCENES BY STARTTIME, NEWEST FIRST ###
+    scenes = sorted(scenes, key=operator.itemgetter('startTime'), reverse=True)
+    if opt_dict['monMin'] or opt_dict['monMax']:
+        try:
+            scenes = [r for r in sorted(scenes, key=operator.itemgetter('startTime')) 
+                     if datetime.datetime.strptime(r['startTime'],"%Y-%m-%d %H:%M:%S").month >= opt_dict['monMin'] 
+                     and datetime.datetime.strptime(r['startTime'],"%Y-%m-%d %H:%M:%S").month <= opt_dict['monMax'] ]
+        except:
+            scenes = [r for r in sorted(scenes, key=operator.itemgetter('startTime'))
+                     if datetime.datetime.strptime(r['startTime'],"%Y-%m-%dT%H:%M:%S.%f").month >= opt_dict['monMin']
+                     and datetime.datetime.strptime(r['startTime'],"%Y-%m-%dT%H:%M:%S.%f").month <= opt_dict['monMax'] ]
+        print("Scenes after filtering for monthMin %d and monthMax %d: %d" % (opt_dict['monMin'],opt_dict['monMax'],len(scenes)))
+    if opt_dict['noswath']:
+        scenes = [ r for r in sorted(scenes) if r['firstFrame']==r['finalFrame'] ]
+        print("Scenes after filtering out swaths: %d" % len(scenes))
+
+    lats = []
+    lons = []
+    for scene in scenes:
+        fp = re.findall(r"[+-]? *(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", scene['stringFootprint'])
+        for t in map(lambda i: float(fp[i]), filter(lambda i: i % 2 == 1, range(len(fp)))):
+            lats.append(t)
+        for t in map(lambda i: float(fp[i]), filter(lambda i: i % 2 == 0, range(len(fp)))):
+            lons.append(t)
+    north = max(lats)+0.15
+    south = min(lats)-0.15
+    east = max(lons)+0.15
+    west = min(lons)-0.15
+
+    if not opt_dict['kml'] and not opt_dict['download'] and not opt_dict['print']:
+        print("You did not specify the --kml, --print, or --download option, so there really is nothing else I can do for you now")
+    if opt_dict['print']:
+        print("# Collection,Platform,AbsOrbit,StartTime,StopTime,RelOrbit,FirstFrame,FinalFrame,BeamMode,BeamSwath,FlightDir,LookDir,Polarization,FileName,DownloadURL")
+        for r in sorted(scenes, key=operator.itemgetter('startTime')):
+            overlap_info = ""
+            if '_aoiOverlapPercent' in r:
+                overlap_info = f" [AOI Overlap: {r['_aoiOverlapPercent']}%]"
+            print(",".join(str(x) for x in [r.get('collectionName', ''), r.get('platform', ''), r.get('absoluteOrbit', ''),
+                                            r.get('startTime', ''), r.get('stopTime', ''),
+                                            r.get('relativeOrbit', ''), r.get('firstFrame', ''), r.get('finalFrame', ''),
+                                            r.get('beamMode', ''), r.get('beamSwath', ''), r.get('flightDirection', ''),
+                                            r.get('lookDirection', ''),r.get('polarization', ''),
+                                            r.get('fileName', '') or r.get('downloadUrl', ''),
+                                            r.get('downloadUrl', '')]) + overlap_info)
+    ### MAKE THE CSV FILE ###
+    if opt_dict['csv']:
+        with open('ssara_federated_search_'+datetime.datetime.now().strftime("%Y%m%d%H%M%S")+".csv",'w') as CSV:
+            writer = csv.writer(CSV)
+            header = ['Collection','Platform','absOrbit','relOrbit','First Frame','Final Frame','Start Time','Stop Time','Beam Mode','Swath','Flight Dir','Look Dir','Polarization','Process Level','URL','WKT']
+            if opt_dict['minAoiOverlap'] > 0:
+                header.append('AOI Overlap %')
+            writer.writerow(header)
+            for scene in sorted(scenes, key=operator.itemgetter('startTime')):
+                row = [scene['collectionName'],scene['platform'],scene['absoluteOrbit'],scene['relativeOrbit'],
+                       scene['firstFrame'],scene['finalFrame'],scene['startTime'],scene['stopTime'],scene['beamMode'],
+                       scene['beamSwath'],scene['flightDirection'],scene['lookDirection'],scene['polarization'],
+                       scene['processingLevel'],scene['downloadUrl'],scene['stringFootprint']]
+                if opt_dict['minAoiOverlap'] > 0:
+                    row.append(scene.get('_aoiOverlapPercent', ''))
+                writer.writerow(row)
+
+    ### GET A KML FILE ###
+    if opt_dict['kml']:
+        # Always get the original KML from API first
+        ssara_url = SSARA_API_URL_ROOT + "/api/sar/search?output=kml&%s" % params
+        print("Getting KML from API...")
+        t = time.time()
+        r = urlopen(ssara_url)
+        originalName = r.info()['Content-Disposition'].split('filename=')[1].replace('"','')
+        if opt_dict['kml_filename']:
+            originalName = opt_dict['kml_filename']
+        print(f"Saving KML from {nscenes_all} scenes to {originalName}")
+        f = open(originalName, 'wb')
+        f.write(r.read())
+        f.close()
+
+        
+        # If AOI filtering was applied, generate an additional filtered KML
+        if opt_dict['minAoiOverlap'] > 0 and opt_dict['intersectsWith']:
+            # print("Generating filtered KML from %d scenes..." % len(scenes))
+            
+            # Create filtered filename based on original name
+            base_name = originalName.replace('.kml', '')
+            filteredName = base_name + '_aoi_filtered.kml'            
+            generate_kml_from_scenes(scenes, filteredName, opt_dict)
+            print(f"Saving KML from {len(scenes)} scenes to {filteredName} after applying AOI overlap filter of {opt_dict['minAoiOverlap']}%")
+
+    ### DOWNLOAD THE DATA FROM THE QUERY RESULTS ### 
+    if opt_dict['dem']:
+        print("Downloading DEM")
+        os.system('curl -X GET "https://portal.opentopography.org/API/globaldem?north=%f&south=%f&east=%f&west=%f&outputFormat=GTiff&demtype=SRTMGL1_E" -H "accept: */*" -o dem.wgs84.tif' % (north,south,east,west))
+    if opt_dict['download']:
+        allGood = True
+        for collection in list(set([d.get('collectionName') or '' for d in scenes])):
+            # print(f"collection: {collection}")
+            if collection is None: #Modified Enrique 2026/06
+                collection = '' #Modified Enrique 2026/06
+            if collection and ('WInSAR' in collection or 'EarthScope' in collection) and not (password_config.unavuser and password_config.unavpass):
+            #if ('WInSAR' in collection or 'EarthScope' in collection) and not (password_config.unavuser and password_config.unavpass ):
+                print("Can't download collection: %s" % collection)
+                print("You need to specify your UNAVCO username and password in password_config.py")
+                print("If you don't have a UNAVCO username/password, limit the query with the --collection option\n")
+                allGood = False
+            if collection and 'ASF' in collection and not (password_config.asfuser and password_config.asfpass ):
+                print("Can't download collection: %s" % collection)
+                print("You need to specify your ASF username and password in password_config.py")
+                print("If you don't have a ASF username/password, limit the query with the --collection option\n")
+                allGood = False
+            #
+            # #####
+            # THe VA4 has been shut down, so the following section is commented out
+            # if 'Supersites VA4' in collection and not (password_config.eossouser and password_config.eossopass ):
+            #     print("Can't download collection: %s" % collection)
+            #     print("You need to specify your EO Single Sign On username and password in password_config.py")
+            #     print("\n****************************************************************")
+            #     print("For the Supersites VA4 data, you need an EO Single Sign On username/password:")
+            #     print("Sign up for one here: https://eo-sso-idp.eo.esa.int/idp/AuthnEngine")
+            #     print("****************************************************************\n")
+            #     allGood = False
+
+        if not allGood:
+            print("Exiting now since some username/password are needed for data download to continue")
+            exit()
+        print("Downloading data now, %d at a time." % opt_dict['parallel'])
+        #create a queue for parallel downloading
+        queue = Queue()
+        #spawn a pool of threads, and pass them queue instance 
+        for i in range(opt_dict['parallel']):
+            t = ThreadDownload(queue)
+            # t.setDaemon(True)
+            t.daemon=True
+            t.start()
+        #populate queue with data   
+        for d in sorted(scenes, key=lambda x: x.get('collectionName') or ''):
+            queue.put([d, opt_dict])
+        #wait on the queue until everything has been processed     
+        queue.join()
+    ### Sentinel-1 Orbit Data Download ###
+    if opt_dict['s1orbits']:
+        if not scenes:
+            print(f"Did not find any scenes.")
+        else:
+            print("Getting orbit lists from ASF")
+            orb_links = get_s1orb_list_from_ASF() #get the URL of all orbits from ASF
+            sceneIDs = []
+            for scene in scenes:
+                sceneIDs.append(scene['fileName'])            
+            download_S1_orbit_from_ASF(sceneIDs, orb_links)
+                
+
+def generate_kml_from_scenes(scenes, filename, opt_dict):
+    """
+    Generate KML file from filtered scenes
+    
+    Args:
+        scenes: List of scene dictionaries
+        filename: Output KML filename
+        opt_dict: Options dictionary
+    """
+    kml_header = '''<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+<name>SSARA Filtered Search Results</name>
+<description>SAR scenes filtered by AOI overlap (min {}%)</description>
+<Style id="sceneStyle">
+    <LineStyle>
+        <color>ffff0000</color>
+        <width>2</width>
+    </LineStyle>
+    <PolyStyle>
+        <color>3fff00ff</color>
+        <fill>0</fill>
+        <outline>1</outline>
+    </PolyStyle>
+</Style>
+'''.format(opt_dict.get('minAoiOverlap', 0))
+    
+    kml_footer = '''
+</Document>
+</kml>'''
+    
+    with open(filename, 'w') as f:
+        f.write(kml_header)
+        
+        for scene in scenes:
+            if 'stringFootprint' not in scene or not scene['stringFootprint']:
+                continue
+            
+            # Parse WKT footprint
+            try:
+                footprint_wkt = scene['stringFootprint']
+                # Extract coordinates from POLYGON((lon1 lat1, lon2 lat2, ...))
+                coords_match = re.search(r'POLYGON\s*\(\((.*?)\)\)', footprint_wkt)
+                if not coords_match:
+                    continue
+                
+                coords_str = coords_match.group(1)
+                coord_pairs = coords_str.split(',')
+                
+                # Convert to KML format (lon,lat,0)
+                kml_coords = []
+                for pair in coord_pairs:
+                    parts = pair.strip().split()
+                    if len(parts) >= 2:
+                        lon, lat = parts[0], parts[1]
+                        kml_coords.append(f'{lon},{lat},0')
+                
+                if not kml_coords:
+                    continue
+                
+                # Get overlap percentage if available
+                overlap_info = ""
+                if '_aoiOverlapPercent' in scene:
+                    overlap_info = f"<br/><b>AOI Overlap:</b> {scene['_aoiOverlapPercent']}%"
+                
+                # Create placemark
+                placemark = f'''
+<Placemark>
+    <name>{scene.get('platform', 'Unknown')} - {scene.get('startTime', '')[:10]}</name>
+    <description><![CDATA[
+        <b>Source:</b> {scene.get('_source', 'Unknown')}<br/>
+        <b>Collection:</b> {scene.get('collectionName', 'N/A')}<br/>
+        <b>Platform:</b> {scene.get('platform', 'N/A')}<br/>
+        <b>Absolute Orbit:</b> {scene.get('absoluteOrbit', 'N/A')}<br/>
+        <b>Relative Orbit:</b> {scene.get('relativeOrbit', 'N/A')}<br/>
+        <b>Frame:</b> {scene.get('firstFrame', 'N/A')}-{scene.get('finalFrame', 'N/A')}<br/>
+        <b>Start Time:</b> {scene.get('startTime', 'N/A')}<br/>
+        <b>Stop Time:</b> {scene.get('stopTime', 'N/A')}<br/>
+        <b>Beam Mode:</b> {scene.get('beamMode', 'N/A')}<br/>
+        <b>Beam Swath:</b> {scene.get('beamSwath', 'N/A')}<br/>
+        <b>Polarization:</b> {scene.get('polarization', 'N/A')}<br/>
+        <b>Processing Level:</b> {scene.get('processingLevel', 'N/A')}<br/>
+        <b>Flight Direction:</b> {scene.get('flightDirection', 'N/A')}<br/>
+        <b>Look Direction:</b> {scene.get('lookDirection', 'N/A')}{overlap_info}<br/>
+        <b>Download:</b> <a href="{scene.get('downloadUrl', 'N/A')}">{scene.get('downloadUrl', 'N/A')}</a>
+    ]]></description>
+    <styleUrl>#sceneStyle</styleUrl>
+    <Polygon>
+        <outerBoundaryIs>
+            <LinearRing>
+                <coordinates>
+                    {' '.join(kml_coords)}
+                </coordinates>
+            </LinearRing>
+        </outerBoundaryIs>
+    </Polygon>
+</Placemark>
+'''
+                f.write(placemark)
+                
+            except Exception as e:
+                print(f"Warning: Could not process footprint for scene: {e}")
+                continue
+        
+        f.write(kml_footer)
+
+
+def get_s1orb_list_from_ASF():
+    poe_url_root = 'https://s1qc.asf.alaska.edu/aux_poeorb/'
+    response = urllib.request.urlopen(poe_url_root)
+    html_content = response.read().decode('utf-8')
+    file_pattern = r'href=["\'](.*?\.(EOF))["\']'
+    matches = re.findall(file_pattern, html_content)
+    poeorb_links = [poe_url_root+match[0] for match in matches]
+
+    res_url_root = 'https://s1qc.asf.alaska.edu/aux_resorb/'
+    response = urllib.request.urlopen(res_url_root)
+    html_content = response.read().decode('utf-8')
+    file_pattern = r'href=["\'](.*?\.(EOF))["\']'
+    matches = re.findall(file_pattern, html_content)
+    resorb_links = [res_url_root+match[0] for match in matches]
+    orb_links = poeorb_links + resorb_links
+    
+    return orb_links
+
+def download_S1_orbit_from_ASF(sceneIDs, orb_links):
+    """Downloading S1 Orbit from ASF based on the name of the scene"""
+    for sceneID in sceneIDs:
+        # print(f"Checking orbits for {sceneID}")
+        scene_start_time = sceneID[17:32]
+        scene_time = datetime.datetime.strptime(scene_start_time,'%Y%m%dT%H%M%S')
+        sat = os.path.basename(sceneID).split("_")[0]
+        url_orbit_find = []
+        time_produced = [] 
+        for url in orb_links:
+            eof = url.split('/')[-1]
+            # Split the timestamp segment by '_' to get the two times
+            _, timestamp_segment = eof.split('V')
+            time1_str, time2_with_suffix = timestamp_segment.split('_')
+
+            # Remove the '.EOF' suffix from the second time string
+            time2_str = time2_with_suffix.split('.')[0]
+            # Convert the extracted time strings to datetime objects
+            time1 = datetime.datetime.strptime(time1_str, '%Y%m%dT%H%M%S')
+            time2 = datetime.datetime.strptime(time2_str, '%Y%m%dT%H%M%S')
+            str_time_orbit_produced = eof[25:40]
+            time_orbit_produced = datetime.datetime.strptime(str_time_orbit_produced,'%Y%m%dT%H%M%S')
+
+            if sat in url and time1< scene_time < time2:
+                url_orbit_find.append(url)
+                time_produced.append(time_orbit_produced)
+                # print(url)
+        if len(url_orbit_find) > 0:
+            print(f"****Found multiple orbits covering {sceneID}****")
+            for url in url_orbit_find:
+                orbit = url.split('/')[-1]
+                print(f"== {orbit} ==")
+            index_most_recent = time_produced.index(max(time_produced))
+            url_to_download = url_orbit_find[index_most_recent]
+            orbit_file = url_to_download.split('/')[-1]
+            print(f"The most recent orbit is: {orbit_file}")
+            if os.path.exists(orbit_file):
+                print("Already downloaded %s" % orbit_file)
+            else:
+                # print(f"Downloading {orbit_file}")
+                cmd = f"wget --user={password_config.asfuser} --password={password_config.asfpass} {url_to_download}"
+                try:
+                    result = sub.run(cmd, shell=True, check=True, stdout=sub.PIPE, stderr=sub.PIPE)
+                    print(f"Download {orbit_file} successful.")
+                    # print("Command output:", result.stdout.decode())
+                except sub.CalledProcessError as e:
+                    print(f"Download {orbit_file} failed with exit code {e.returncode}")
+                    print("Error output:", e.stderr.decode())
+        else:
+            print(f"****No orbit found covering {sceneID}****")
+
+
+
+        
+def asf_dl(d, opt_dict):
+    url = d['downloadUrl']
+    filename = os.path.basename(url)
+    print("ASF Download:",filename)
+    start = time.time()
+    cmd = 'wget -nv -c --user=%s --password=%s %s' % (password_config.asfuser,password_config.asfpass,url)
+    pipe = sub.Popen(cmd, shell=True, stdout=sub.PIPE, stderr=sub.STDOUT).stdout
+    pipe.read()
+    total_time = time.time() - start
+    mb_sec = (os.path.getsize(filename) / (1024 * 1024.0)) / total_time
+    print("%s download time: %.2f secs (%.2f MB/sec)" % (filename, total_time, mb_sec))
+        
+def unavco_dl(d, opt_dict):
+    """Download EarthScope file via Django Basic Auth endpoint."""
+    url = d.get('downloadUrl', '')
+    if not url:
+        print("Warning: Scene has no download URL")
+        return
+
+    # Send Basic Auth preemptively (urllib's HTTPBasicAuthHandler only responds
+    # to 401 challenges, but Django returns 302 for unauthenticated requests)
+    credentials = base64.b64encode(
+        f"{password_config.unavuser}:{password_config.unavpass}".encode()
+    ).decode()
+    req = urllib.request.Request(url)
+    req.add_header('Authorization', f'Basic {credentials}')
+    opener = build_opener()
+
+    try:
+        f = opener.open(req)
+    except HTTPError as e:
+        print("Error opening URL %s: %s" % (url, e))
+        return
+
+    # Filename comes from the final redirected signed URL
+    final_url = f.geturl()
+    filename = os.path.basename(final_url.split('?')[0])
+    if not filename:
+        filename = 'download_' + str(int(time.time()))
+
+    print("EarthScope Download:", filename)
+
+    try:
+        dl_file_size = int(f.info()['Content-Length'])
+    except (KeyError, ValueError):
+        dl_file_size = None
+
+    if os.path.exists(filename) and dl_file_size:
+        if os.path.getsize(filename) == dl_file_size:
+            print("%s already downloaded" % filename)
+            f.close()
+            return
+
+    start = time.time()
+    CHUNK = 256 * 10240
+    try:
+        with open(filename, 'wb') as fp:
+            while True:
+                chunk = f.read(CHUNK)
+                if not chunk:
+                    break
+                fp.write(chunk)
+        total_time = time.time() - start
+        if os.path.exists(filename):
+            file_size = os.path.getsize(filename)
+            mb_sec = (file_size / (1024 * 1024.0)) / total_time if total_time > 0 else 0
+            print("%s download time: %.2f secs (%.2f MB/sec)" % (filename, total_time, mb_sec))
+        else:
+            print("%s download FAILED" % filename)
+    except Exception as e:
+        print("Error downloading %s: %s" % (filename, e))
+    finally:
+        f.close()
+    
+def unavco_dl_wget(d, opt_dict):
+    """Download EarthScope file via curl/wget for better performance on large files.
+    Captures the signed URL from the redirect header without opening the file
+    connection, then hands off to curl (or wget as fallback).
+    """
+    url = d.get('downloadUrl', '')
+    if not url:
+        print("Warning: Scene has no download URL")
+        return
+
+    credentials = base64.b64encode(
+        f"{password_config.unavuser}:{password_config.unavpass}".encode()
+    ).decode()
+    req = urllib.request.Request(url)
+    req.add_header('Authorization', f'Basic {credentials}')
+
+    # Intercept the redirect to get the signed URL without opening a connection
+    # to the file server (avoids a wasted TCP handshake + slow-start cycle)
+    class _StopRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise HTTPError(newurl, code, msg, headers, fp)
+
+    opener = build_opener(_StopRedirect)
+    signed_url = None
+    try:
+        opener.open(req)
+    except HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            signed_url = e.headers.get('Location')
+        else:
+            print("Error resolving download URL %s: %s" % (url, e))
+            return
+    except Exception as e:
+        print("Error resolving download URL %s: %s" % (url, e))
+        return
+
+    if not signed_url:
+        print("Error: could not get signed URL")
+        return
+
+    filename = os.path.basename(signed_url.split('?')[0])
+    if not filename:
+        filename = d.get('fileName', 'download_' + str(int(time.time())))
+
+    print("EarthScope Download:", filename)
+    start = time.time()
+
+    # Use curl if available (better HTTPS performance), fall back to wget
+    curl_available = sub.run('which curl', shell=True, stdout=sub.DEVNULL, stderr=sub.DEVNULL).returncode == 0
+    if curl_available:
+        cmd = 'curl -# -C - -o %s "%s"' % (filename, signed_url)
+    else:
+        cmd = 'wget -c --show-progress -O %s "%s"' % (filename, signed_url)
+
+    result = sub.run(cmd, shell=True)
+    total_time = time.time() - start
+    if result.returncode == 0 and os.path.exists(filename) and total_time > 0:
+        mb_sec = (os.path.getsize(filename) / (1024 * 1024.0)) / total_time
+        print("%s download time: %.2f secs (%.2f MB/sec)" % (filename, total_time, mb_sec))
+    else:
+        print("%s download FAILED" % filename)
+
+
+def va4_dl(d, opt_dict):
+    user_name = password_config.eossouser
+    user_password = password_config.eossopass
+    url = d['downloadUrl']
+    filename = os.path.basename(url)
+    secp_path = os.path.dirname(sys.argv[0])+"/data_utils/secp"
+    cmd = """%s -C %s:%s %s""" % (secp_path,user_name,user_password,d['downloadUrl'])
+    print("Downloading:",url)
+    start = time.time()
+    pipe = sub.Popen(cmd, shell=True, stdout=sub.PIPE, stderr=sub.STDOUT).stdout
+    pipe.read()
+    total_time = time.time() - start
+    mb_sec = (os.path.getsize(filename) / (1024 * 1024.0)) / total_time
+    print("%s download time: %.2f secs (%.2f MB/sec)" % (filename, total_time, mb_sec))
+    
+class ThreadDownload(threading.Thread):
+    """Threaded SAR data download"""
+    def __init__(self, queue):
+        threading.Thread.__init__(self)
+        self.queue = queue
+
+    def run(self):
+        while True:
+            d, opt_dict = self.queue.get()
+            url = d.get('downloadUrl') or ''
+            if 'unavco' in url or 'web-services' in url:
+                unavco_dl_wget(d, opt_dict)
+            elif 'asf' in url:
+                asf_dl(d, opt_dict)
+            else:
+                print("Warning: Scene has no valid downloadUrl, skipping:", d.get('fileName', 'unknown'))
+            # elif d['collectionName'] == 'Supersites VA4':
+            #     va4_dl(d,opt_dict)
+            self.queue.task_done()
+             
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,16 @@
+.zip
+__pycache__/
+CLAUDE.md
+scratch/
+.local/
+.cache/
+.config/
+.Xauthority
+.vscode-server/
+.dotnet/
+snap/
+.ssh/authorized_keys
+.ssh/id_ed25519
+.ssh/id_ed25519.pub
+.ssh/known_hosts
+.ssh/known_hosts.old

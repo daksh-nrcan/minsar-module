@@ -1,0 +1,11 @@
+ssaraopt.platform               = SENTINEL-1A,SENTINEL-1B,SENTINEL-1C
+ssaraopt.relativeOrbit          = 49
+ssaraopt.startDate              = 20260501
+ssaraopt.endDate                = 20260514
+
+topsStack.boundingBox           = 53.9 54.4 -113.3 -112.7    # S N W E
+topsStack.subswath              = 1 2 3
+topsStack.coregistration        = geometry
+
+minsar.upload_flag              = False
+minsar.insarmaps_flag           = False

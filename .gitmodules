@@ -1,0 +1,3 @@
+[submodule "minsar"]
+	path = minsar
+	url = https://github.com/geodesymiami/minsar.git
